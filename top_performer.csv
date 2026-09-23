@@ -1,0 +1,7 @@
+agent_id,packages_delivered,total_distance,efficiency
+A3,1,14.14,14.14
+
+route_step,x,y
+start,95.0,30.0
+pickup P3 @ W3,100.0,25.0
+deliver P3,105.0,20.0
