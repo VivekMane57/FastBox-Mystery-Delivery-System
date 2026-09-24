@@ -1,20 +1,15 @@
 """
 FastBox Mystery Delivery System
---------------------------------
-Simulates one day of delivery operations for a fictional logistics
-company (FastBox). Reads warehouse / agent / package data from a JSON
-file, assigns each package to the nearest available agent, simulates
-the pickups + deliveries, and writes a report.json with per-agent
-stats and the best (most efficient) agent.
 
-Run:
+Simulates one day of delivery operations: assigns packages to the
+nearest agent, simulates pickup/delivery routes, and writes a report.
+
+Usage:
     python delivery_system.py data.json
-    python delivery_system.py data.json --report report.json --ascii --csv
+    python delivery_system.py data.json --report report.json --ascii --csv --delays
 
 Tests:
     pytest test_delivery_system.py -v
-
-Author: Vivek
 """
 
 from __future__ import annotations
@@ -38,44 +33,17 @@ logging.basicConfig(
 logger = logging.getLogger("fastbox")
 
 
-# ---------------------------------------------------------------------------
-# Custom exceptions -- so callers (and tests) can catch specific failure
-# modes instead of a bare Exception / raw traceback.
-# ---------------------------------------------------------------------------
-
 class DeliveryDataError(ValueError):
-    """Raised when the input JSON is missing required fields or malformed."""
+    """Raised when input JSON is missing fields or malformed."""
 
 
-# ---------------------------------------------------------------------------
-# 1. JSON PARSING
-# ---------------------------------------------------------------------------
-# ASSUMPTION (documented, since the assignment PDF example and the actual
-# test_case_*.json files use two DIFFERENT schemas):
-#   Schema A (PDF example / base_case.json):
-#       "warehouses": {"W1": [0, 0], ...}                 (dict-style)
-#       or [{"id": "W1", "location": [0, 0]}, ...]         (list-style)
-#       "packages": [{"id": "P1", "warehouse_id": "W1", "destination": [x,y]}]
-#   Schema B (every provided test_case file):
-#       "warehouses": {"W1": [x, y], ...}
-#       "agents": {"A1": [x, y], ...}
-#       "packages": [{"id": "P1", "warehouse": "W1", "destination": [x, y]}]
-#
-# Rather than assuming one fixed shape, the loader below normalizes BOTH
-# styles into simple dicts, and validates the result so bad input fails
-# fast with a clear message instead of a raw traceback deep in the sim.
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# JSON parsing
+# --------------------------------------------------------------------------
 
 def _normalize_locations(raw: Any, field_name: str) -> "OrderedDict[str, Point]":
-    """
-    Accepts either:
-        {"W1": [x, y], "W2": [x, y], ...}
-    or
-        [{"id": "W1", "location": [x, y]}, ...]
-    Returns an OrderedDict: {id: (x, y)} preserving input order
-    (order matters later for deterministic tie-breaking).
-    Raises DeliveryDataError on malformed entries.
-    """
+    """Normalizes {'id': [x, y]} or [{'id':.., 'location':[x, y]}] into an
+    OrderedDict of id -> (x, y). Order is preserved for tie-breaking."""
     result: "OrderedDict[str, Point]" = OrderedDict()
 
     if isinstance(raw, dict):
@@ -105,18 +73,9 @@ def _normalize_locations(raw: Any, field_name: str) -> "OrderedDict[str, Point]"
 
 
 def load_data(path: str) -> Dict[str, Any]:
-    """
-    Reads and parses the input JSON file, then normalizes it into a
-    predictable internal structure:
-        {
-            "warehouses": {id: (x, y), ...},
-            "agents":     {id: (x, y), ...},
-            "packages":   [{"id": .., "warehouse": .., "destination": (x, y)}, ...]
-        }
-    Raises:
-        FileNotFoundError    -- if `path` doesn't exist (clear message, not a traceback)
-        DeliveryDataError    -- if the JSON is valid but the schema is wrong/incomplete
-    """
+    """Reads and validates the input JSON, normalizing both supported
+    schemas (dict-style and list-style warehouses/agents; 'warehouse'
+    or 'warehouse_id' package key) into a single internal structure."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -145,7 +104,6 @@ def load_data(path: str) -> Dict[str, Any]:
             raise DeliveryDataError(f"Duplicate package id: '{pkg_id}'")
         seen_ids.add(pkg_id)
 
-        # Support both "warehouse" and "warehouse_id" keys.
         wh_id = pkg.get("warehouse", pkg.get("warehouse_id"))
         if wh_id is None:
             raise DeliveryDataError(f"Package '{pkg_id}' has no warehouse reference")
@@ -167,36 +125,22 @@ def load_data(path: str) -> Dict[str, Any]:
     return {"warehouses": warehouses, "agents": agents, "packages": packages}
 
 
-# ---------------------------------------------------------------------------
-# 2. DISTANCE
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Distance
+# --------------------------------------------------------------------------
 
 def euclidean(p1: Point, p2: Point) -> float:
-    """Straight-line distance between two (x, y) points."""
+    """Straight-line distance between two points."""
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
 
-# ---------------------------------------------------------------------------
-# 3. AGENT <-> PACKAGE ASSIGNMENT
-# ---------------------------------------------------------------------------
-# ASSUMPTION: "nearest agent" is measured from each agent's STARTING
-# location to the package's WAREHOUSE (as literally described in the
-# assignment: "distance from agent to warehouse"). Agents are not removed
-# from the pool after being assigned a package -- a single agent can be
-# responsible for several packages (this matches the sample report, where
-# A1 and A2 each deliver 2 packages).
-#
-# TIE-BREAK ASSUMPTION: if two or more agents are exactly equidistant from
-# a warehouse, the agent that appears EARLIEST in the input "agents" data
-# wins. This keeps the assignment deterministic and reproducible.
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Assignment
+# --------------------------------------------------------------------------
 
 def assign_packages(data: Dict[str, Any]) -> "OrderedDict[str, List[Dict[str, Any]]]":
-    """
-    Returns an OrderedDict: {agent_id: [package, package, ...]}
-    Packages keep the order they appeared in the input file, which also
-    becomes the pickup/delivery order used during simulation.
-    """
+    """Assigns each package to the agent nearest its warehouse. Agents
+    can receive multiple packages; ties go to the earlier-listed agent."""
     agents = data["agents"]
     warehouses = data["warehouses"]
     assignment: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict(
@@ -219,19 +163,9 @@ def assign_packages(data: Dict[str, Any]) -> "OrderedDict[str, List[Dict[str, An
     return assignment
 
 
-# ---------------------------------------------------------------------------
-# 4. SIMULATION
-# ---------------------------------------------------------------------------
-# ASSUMPTION: each agent starts at their own starting location. For every
-# package assigned to them (processed in the order above), the agent:
-#   1. Travels from their CURRENT position to the package's warehouse
-#      (pickup leg).
-#   2. Travels from the warehouse to the package's destination
-#      (delivery leg).
-#   3. Their "current position" becomes that destination, ready for the
-#      next pickup -- agents do NOT teleport back to their starting point
-#      between deliveries, which models "one continuous day of operations".
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Simulation
+# --------------------------------------------------------------------------
 
 def simulate(
     data: Dict[str, Any],
@@ -239,11 +173,9 @@ def simulate(
     delays: bool = False,
     seed: int = 42,
 ) -> "OrderedDict[str, Dict[str, Any]]":
-    """
-    Runs the simulation and returns:
-        {agent_id: {"packages_delivered", "total_distance", "efficiency", "route", [+"delays"]}}
-    ("route" is a list of (label, point) tuples, used by the ASCII bonus.)
-    """
+    """Runs each agent through their assigned packages in order: current
+    position -> warehouse -> destination, updating position after each
+    delivery. Returns per-agent stats plus the route (for the ASCII bonus)."""
     warehouses = data["warehouses"]
     rng = random.Random(seed)
     results: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
@@ -265,8 +197,6 @@ def simulate(
             total_distance += euclidean(wh_loc, dest_loc)
             route.append((f"deliver {pkg['id']}", dest_loc))
 
-            # BONUS: random delivery delay (minutes). Informational only --
-            # does NOT affect distance/efficiency, only the report log.
             if delays:
                 delay_min = rng.choice([0, 0, 0, 5, 10, 15])
                 if delay_min:
@@ -289,20 +219,13 @@ def simulate(
     return results
 
 
-# ---------------------------------------------------------------------------
-# 5. REPORT
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Report
+# --------------------------------------------------------------------------
 
 def build_report(results: "OrderedDict[str, Dict[str, Any]]") -> Dict[str, Any]:
-    """
-    Builds the final report dict, e.g.:
-        {"A1": {"packages_delivered": 2, "total_distance": 85.32,
-                 "efficiency": 42.66}, ..., "best_agent": "A1"}
-    "best_agent" = the agent with the LOWEST efficiency (lowest average
-    distance travelled per package) among agents who delivered at least
-    one package. Agents who delivered nothing are still listed (0s) for
-    transparency.
-    """
+    """Builds the final report dict; best_agent = lowest efficiency
+    (avg distance per package) among agents who delivered at least one."""
     report: Dict[str, Any] = {}
     best_agent: Optional[str] = None
     best_efficiency: Optional[float] = None
@@ -323,26 +246,24 @@ def build_report(results: "OrderedDict[str, Dict[str, Any]]") -> Dict[str, Any]:
 
 
 def sanity_check(data: Dict[str, Any], report: Dict[str, Any]) -> bool:
-    """Bonus safety net requested in the notes: total delivered == total packages."""
+    """Verifies total packages delivered matches total packages."""
     total_delivered = sum(v["packages_delivered"] for k, v in report.items() if k != "best_agent")
     total_packages = len(data["packages"])
     if total_delivered != total_packages:
         logger.warning(
-            "Packages delivered (%d) != total packages (%d). "
-            "Check for an empty agents list or unreachable packages.",
+            "Packages delivered (%d) != total packages (%d)",
             total_delivered, total_packages,
         )
         return False
     return True
 
 
-# ---------------------------------------------------------------------------
-# 6. BONUS: ASCII route visualization
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Bonus: ASCII route visualization
+# --------------------------------------------------------------------------
 
 def ascii_visualize(data: Dict[str, Any], width: int = 60, height: int = 25) -> None:
-    """Prints a crude ASCII map: warehouses (W), agent starts (A), and
-    package destinations (.) scaled to a fixed-size grid."""
+    """Prints warehouses (W), agent starts (A), and destinations (.) on a grid."""
     all_points = (
         list(data["warehouses"].values())
         + list(data["agents"].values())
@@ -360,7 +281,7 @@ def ascii_visualize(data: Dict[str, Any], width: int = 60, height: int = 25) -> 
     def place(point: Point, ch: str) -> None:
         col = int((point[0] - min_x) / span_x * (width - 1))
         row = int((point[1] - min_y) / span_y * (height - 1))
-        row = height - 1 - row  # flip so higher y is up
+        row = height - 1 - row
         grid[row][col] = ch
 
     for loc in data["warehouses"].values():
@@ -377,15 +298,16 @@ def ascii_visualize(data: Dict[str, Any], width: int = 60, height: int = 25) -> 
     print("+" + "-" * width + "+")
 
 
-# ---------------------------------------------------------------------------
-# 7. BONUS: export top performer to CSV
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Bonus: export top performer to CSV
+# --------------------------------------------------------------------------
 
 def export_top_performer_csv(
     report: Dict[str, Any],
     results: "OrderedDict[str, Dict[str, Any]]",
     out_path: str = "top_performer.csv",
 ) -> Optional[str]:
+    """Writes the best agent's stats and full route to a CSV file."""
     best = report.get("best_agent")
     if not best:
         return None
@@ -405,14 +327,9 @@ def export_top_performer_csv(
     return out_path
 
 
-# ---------------------------------------------------------------------------
-# 8. BONUS: new agent joining mid-day
-# ---------------------------------------------------------------------------
-# Simulates a fresh agent joining after some packages are already assigned.
-# Packages from the SECOND HALF of the package list (mid-day onward) are
-# re-assigned considering the new agent too. A simple, explainable model
-# rather than a full re-optimization.
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Bonus: new agent joining mid-day
+# --------------------------------------------------------------------------
 
 def simulate_with_midday_join(
     data: Dict[str, Any],
@@ -420,6 +337,8 @@ def simulate_with_midday_join(
     new_agent_location: Point,
     seed: int = 42,
 ) -> "OrderedDict[str, Dict[str, Any]]":
+    """Splits packages in half; runs the morning half normally, then adds
+    the new agent for the afternoon half and merges per-agent stats."""
     packages = data["packages"]
     midpoint = len(packages) // 2
     morning_packages = packages[:midpoint]
@@ -450,9 +369,9 @@ def simulate_with_midday_join(
     return combined
 
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
 
 def run(
     input_path: str,
@@ -497,7 +416,6 @@ def main() -> None:
         run(args.input, args.report, show_ascii=args.ascii, export_csv=args.csv,
             with_delays=args.delays)
     except (FileNotFoundError, DeliveryDataError) as exc:
-        # Clean, actionable error instead of a raw traceback.
         logger.error(str(exc))
         raise SystemExit(1)
 
