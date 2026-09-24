@@ -9,7 +9,7 @@ pickups + deliveries, and writes a `report.json`.
   report, and bonus features). Fully type-hinted, uses `logging` instead of
   bare `print`, and raises specific exceptions (`DeliveryDataError`,
   `FileNotFoundError`) with actionable messages instead of raw tracebacks.
-- `test_delivery_system.py` — pytest suite (20 tests): distance calc,
+- `test_delivery_system.py` — pytest suite (22 tests): distance calc,
   assignment correctness + tie-breaking, simulation math, report/best-agent
   logic, the `packages_delivered == total_packages` sanity check, and input
   validation (missing keys, unknown warehouse refs, duplicate IDs, malformed
@@ -26,7 +26,7 @@ pickups + deliveries, and writes a `report.json`.
 pip install -r requirements-dev.txt
 pytest test_delivery_system.py -v
 ```
-All 20 tests pass. Coverage highlights:
+All 22 tests pass. Coverage highlights:
 - Assignment produces the exact package-count split (2/2/1) from the PDF's
   sample data, and every package always gets assigned to exactly one agent.
 - Distance/efficiency math is verified against hand-computed values.
